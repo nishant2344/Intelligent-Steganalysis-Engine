@@ -1,76 +1,106 @@
 import os
-import wave
 import librosa
 import numpy as np
 import pandas as pd
 import scipy.io.wavfile as wavfile
+from scipy.stats import kurtosis, skew
 
 def extract_features(file_path, label):
-    """Extracts Spectral, Phase Variance, and LSB statistical markers."""
+    """Extracts Spectral, Byte-Level LSB, and FFT Phase-Ringing forensic markers."""
     try:
-        # --- 1. Raw Signal Features (LSB & Phase Domain) ---
         rate, raw_audio = wavfile.read(file_path)
         if len(raw_audio.shape) > 1:
             raw_audio = raw_audio[:, 0]
 
-        # LSB Statistics (Catches Standard LSB in the first 8000 samples)
-        sample_slice = raw_audio[:8000] if len(raw_audio) >= 8000 else raw_audio
-        lsbs = sample_slice & 1
-        lsb_mean = np.mean(lsbs)
-        # Transition rate: how often consecutive LSBs flip between 0 and 1
-        lsb_transitions = np.mean(np.abs(np.diff(lsbs)))
+        # --- 1. Byte-Level LSB Forensics (Catches Standard LSB) ---
+        raw_bytes = raw_audio.view(np.uint8)
+        head_bytes = raw_bytes[:8000] if len(raw_bytes) >= 8000 else raw_bytes
+        tail_bytes = raw_bytes[8000:16000] if len(raw_bytes) >= 16000 else raw_bytes
 
-        # Phase Domain Statistics (Catches FFT Phase Coding)
+        head_lsbs = head_bytes & 1
+        tail_lsbs = tail_bytes & 1
+
+        # Compare head (potentially infected) vs tail (clean)
+        lsb_head_mean = np.mean(head_lsbs)
+        lsb_tail_mean = np.mean(tail_lsbs)
+        lsb_mean_diff = abs(lsb_head_mean - lsb_tail_mean)
+
+        lsb_head_trans = np.mean(np.abs(np.diff(head_lsbs.astype(np.int8))))
+        lsb_tail_trans = np.mean(np.abs(np.diff(tail_lsbs.astype(np.int8))))
+        lsb_trans_diff = abs(lsb_head_trans - lsb_tail_trans)
+
+        # Odd-byte LSBs (bit 8 of 16-bit PCM) - heavily affected by byte-level LSB
+        odd_head_lsbs = head_bytes[1::2] & 1
+        odd_tail_lsbs = tail_bytes[1::2] & 1
+        odd_lsb_diff = abs(np.mean(odd_head_lsbs) - np.mean(odd_tail_lsbs))
+
+        # --- 2. FFT Phase & Edge-Ringing Forensics (Catches Phase Coding) ---
+        audio_float = raw_audio.astype(np.float64)
+        total_rms = np.sqrt(np.mean(audio_float ** 2)) + 1e-10
+
+        # Global FFT phase shifts leak energy into the silent start/end edges
+        start_edge = audio_float[:500]
+        end_edge = audio_float[-500:]
+        start_rms_ratio = np.sqrt(np.mean(start_edge ** 2)) / total_rms
+        end_rms_ratio = np.sqrt(np.mean(end_edge ** 2)) / total_rms
+        start_max_ratio = np.max(np.abs(start_edge)) / (np.max(np.abs(audio_float)) + 1e-10)
+        end_max_ratio = np.max(np.abs(end_edge)) / (np.max(np.abs(audio_float)) + 1e-10)
+
+        # Phase derivative contrast: Target band (100:1100) vs Adjacent band (1100:2100)
         fft_data = np.fft.rfft(raw_audio)
         phase = np.angle(fft_data)
-        # Focus on the embedding band (bins 100 to 1100) and overall phase diff
-        band_phase = phase[100:1100] if len(phase) > 1100 else phase
-        phase_diff = np.angle(np.exp(1j * np.diff(band_phase)))
-        phase_var = np.var(phase_diff)
-        phase_std = np.std(phase_diff)
-        phase_mean = np.mean(np.abs(phase_diff))
 
-        # --- 2. Librosa Spectral Features ---
+        band1 = phase[100:1100] if len(phase) > 1100 else phase
+        band2 = phase[1100:2100] if len(phase) > 2100 else phase
+
+        diff1 = np.angle(np.exp(1j * np.diff(band1)))
+        diff2 = np.angle(np.exp(1j * np.diff(band2)))
+
+        # Second-order phase difference (group delay)
+        diff1_2nd = np.angle(np.exp(1j * np.diff(diff1)))
+
+        phase_var_ratio = np.var(diff1) / (np.var(diff2) + 1e-10)
+        phase_kurt_1 = kurtosis(diff1)
+        phase_skew_1 = skew(diff1)
+        phase_2nd_std = np.std(diff1_2nd)
+
+        # --- 3. Librosa Spectral Features ---
         y, sr = librosa.load(file_path, sr=None)
-
-        # MFCCs (Mean & Standard Deviation)
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
         mfcc_means = np.mean(mfccs.T, axis=0)
         mfcc_stds = np.std(mfccs.T, axis=0)
 
-        # Zero-Crossing Rate
         zcr = librosa.feature.zero_crossing_rate(y)
-        zcr_mean, zcr_std = np.mean(zcr), np.std(zcr)
-
-        # Spectral Centroid & Rolloff
         cent = librosa.feature.spectral_centroid(y=y, sr=sr)
-        cent_mean, cent_std = np.mean(cent), np.std(cent)
-
         rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
-        roll_mean, roll_std = np.mean(rolloff), np.std(rolloff)
 
-        # Spectral Entropy (with + 1e-10 fix to prevent division by zero)
         S, _ = librosa.magphase(librosa.stft(y))
         power_spectrum = np.abs(S) ** 2
         p = power_spectrum / (np.sum(power_spectrum, axis=0, keepdims=True) + 1e-10)
         spectral_entropy = -np.sum(p * np.log2(p + 1e-10), axis=0)
-        entropy_mean, entropy_std = np.mean(spectral_entropy), np.std(spectral_entropy)
 
-        # Assemble feature dictionary
         features = {
-            'lsb_mean': lsb_mean,
-            'lsb_transitions': lsb_transitions,
-            'phase_var': phase_var,
-            'phase_std': phase_std,
-            'phase_mean': phase_mean,
-            'zcr_mean': zcr_mean,
-            'zcr_std': zcr_std,
-            'cent_mean': cent_mean,
-            'cent_std': cent_std,
-            'roll_mean': roll_mean,
-            'roll_std': roll_std,
-            'entropy_mean': entropy_mean,
-            'entropy_std': entropy_std,
+            'lsb_head_mean': lsb_head_mean,
+            'lsb_mean_diff': lsb_mean_diff,
+            'lsb_head_trans': lsb_head_trans,
+            'lsb_trans_diff': lsb_trans_diff,
+            'odd_lsb_diff': odd_lsb_diff,
+            'start_rms_ratio': start_rms_ratio,
+            'end_rms_ratio': end_rms_ratio,
+            'start_max_ratio': start_max_ratio,
+            'end_max_ratio': end_max_ratio,
+            'phase_var_ratio': phase_var_ratio,
+            'phase_kurt_1': phase_kurt_1,
+            'phase_skew_1': phase_skew_1,
+            'phase_2nd_std': phase_2nd_std,
+            'zcr_mean': np.mean(zcr),
+            'zcr_std': np.std(zcr),
+            'cent_mean': np.mean(cent),
+            'cent_std': np.std(cent),
+            'roll_mean': np.mean(rolloff),
+            'roll_std': np.std(rolloff),
+            'entropy_mean': np.mean(spectral_entropy),
+            'entropy_std': np.std(spectral_entropy),
         }
         for i in range(13):
             features[f'mfcc_mean_{i+1}'] = mfcc_means[i]
@@ -83,10 +113,9 @@ def extract_features(file_path, label):
         return None
 
 def build_feature_dataset(base_dir):
-    print("Starting Phase 3: Advanced DLP Feature Extraction...")
+    print("Starting Upgraded Forensic Feature Extraction...")
     data = []
 
-    # 0 = CLEAN, 1 = STANDARD_LSB, 2 = PHASE_ENCODED
     directories = [
         (os.path.join(base_dir, 'clean_wav'), 0),
         (os.path.join(base_dir, 'infected_wav'), 1),
@@ -107,13 +136,13 @@ def build_feature_dataset(base_dir):
             if features:
                 data.append(features)
 
-            if index % 100 == 0 or index == len(files):
+            if index % 200 == 0 or index == len(files):
                 print(f"  Extracted {index}/{len(files)} files...")
 
     df = pd.DataFrame(data)
     output_csv = os.path.join(base_dir, 'audio_features.csv')
     df.to_csv(output_csv, index=False)
-    print(f"\nPhase 3 Complete! Dataset saved to {output_csv}")
+    print(f"\nExtraction Complete! Saved {len(df)} rows to {output_csv}")
 
 if __name__ == "__main__":
     base_data_directory = r"D:\FINAL_PROJECT\ISE\data"
